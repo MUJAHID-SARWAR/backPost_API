@@ -1,80 +1,94 @@
 const express = require('express');
 const crypto = require('crypto');
 const dotenv = require('dotenv');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const PostbackModel = require('./model/PostbackModel');
+const UserModel = require('./model/UserModel');
 
 dotenv.config(); // Load .env file
 
 const app = express();
+app.use(cors()); // Add CORS middleware
 app.use(express.json()); // Middleware to parse JSON
 
-// In-memory storage
-const transactions = [];
-const users = {
-  '123': { virtual_balance: 0 }
-};
+// Connect to MongoDB
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(() => {
+  console.log('MongoDB Connected...');
+}).catch((err) => {
+  console.error('MongoDB connection error:', err);
+  process.exit(1);
+});
 
 // Example of a postback API endpoint
-app.get('/postback', async (req, res) => {
+app.post('/postback', async (req, res) => {
   const secretKey = process.env.SECRET_KEY;
 
   // Fetch and assign values from the postback request
-  const uid = req.query.extra_1; // User ID
-  const transaction_id = req.query.transaction_id;
-  const payout = req.query.payout;
-  const app_bundle_id = req.query.app_bundle_id;
-  const adv_app_name = req.query.adv_app_name;
-  const virtual_currency = req.query.virtual_currency;
-  const ip = req.query.ip;
-  const event_name = req.query.event_name;
-  const campaign_id = req.query.campaign_id;
-  const hash = req.query.sig; // Signature
-
-  // Format date (if applicable)
-  const begin_time = req.query.begin_time || ''; 
-  const complete_time = req.query.complete_time || '';
+  const {
+    extra_1: uid,
+    transaction_id,
+    payout,
+    app_bundle_id,
+    adv_app_name,
+    virtual_currency,
+    ip,
+    event_name,
+    campaign_id,
+    sig: hash,
+    begin_time = '',
+    complete_time = ''
+  } = req.body;
 
   try {
-    // ###### Validate Hash ######
+    // Validate Hash
     const checkString = `${transaction_id}-${uid}-${secretKey}`;
     const generatedHash = crypto.createHash('md5').update(checkString).digest('hex');
 
-    // Compare provided hash with generated hash
     if (generatedHash !== hash) {
       res.status(400).send("Invalid postback: Signature doesn't match.");
       return;
     }
 
-    // (no duplicate transactions allowed)
-    const transactionExist = transactions.find(t => t.uid === uid && t.transaction_id === transaction_id);
+    // Check for duplicate transactions
+    const transactionExist = await PostbackModel.findOne({ uid, transaction_id, offer_id: campaign_id });
 
     if (transactionExist) {
       res.status(200).send("Duplicate transaction detected.");
       return;
     }
 
-    // Create a new transaction record in memory
-    transactions.push({
+    // Create a new transaction record
+    const newTransaction = new PostbackModel({
       uid,
       transaction_id,
+      provider_id: 2,
+      sbx_amount: virtual_currency,
+      conversion_ip: ip,
       payout,
-      app_bundle_id,
-      adv_app_name,
-      virtual_currency,
-      ip,
+      offer_name: adv_app_name,
+      offer_id: app_bundle_id,
       event_name,
-      campaign_id,
-      begin_time,
-      complete_time
+      offer_begin_time: begin_time,
+      offer_complete_time: complete_time
     });
+    await newTransaction.save();
 
-  
-    const userData = users[uid] || { virtual_balance: 0 };
-    const currentBalance = parseFloat(userData.virtual_balance);
+    // Update user balance
+    let user = await UserModel.findOne({ uid });
+
+    if (!user) {
+      user = new UserModel({ uid });
+    }
+
+    const currentBalance = parseFloat(user.bux_balance || 0);
     const finalBalance = currentBalance + parseFloat(virtual_currency);
+    user.bux_balance = finalBalance;
+    await user.save();
 
-    users[uid] = { virtual_balance: finalBalance };
-
-    // Respond to the client (postback success)
     res.status(200).send("Postback received successfully.");
   } catch (error) {
     console.error('Error processing postback:', error);
