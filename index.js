@@ -1,16 +1,15 @@
 const express = require('express');
-const crypto = require('crypto');
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const PostbackModel = require('./model/PostbackModel');
-const UserModel = require('./model/UserModel');
+const PostbackModel = require('./model/PostbackModel');  
+const UserModel = require('./model/UserModel');          
 
-dotenv.config(); // Load .env file
+dotenv.config();
 
 const app = express();
-app.use(cors()); // Add CORS middleware
-app.use(express.json()); // Middleware to parse JSON
+app.use(cors());
+app.use(express.json());
 
 // Connect to MongoDB
 mongoose.connect(process.env.MONGODB_URI, {
@@ -23,11 +22,21 @@ mongoose.connect(process.env.MONGODB_URI, {
   process.exit(1);
 });
 
-// Example of a postback API endpoint
-app.post('/postback', async (req, res) => {
-  const secretKey = process.env.SECRET_KEY;
+// Middleware to extract the IP address
+app.use((req, res, next) => {
+  const requestIP = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+  const allowedIP = process.env.ALLOWED_IP;
 
-  // Fetch and assign values from the postback request
+  const isLocalhost = requestIP === '::1' || requestIP === '127.0.0.1';
+
+  if (!isLocalhost && requestIP !== allowedIP) {
+    return res.status(403).send("Access denied: IP not allowed.");
+  }
+
+  next();
+});
+
+app.post('/postback', async (req, res) => {
   const {
     extra_1: uid,
     transaction_id,
@@ -38,34 +47,25 @@ app.post('/postback', async (req, res) => {
     ip,
     event_name,
     campaign_id,
-    sig: hash,
     begin_time = '',
     complete_time = ''
   } = req.body;
 
   try {
-    // Validate Hash
-    const checkString = `${transaction_id}-${uid}-${secretKey}`;
-    const generatedHash = crypto.createHash('md5').update(checkString).digest('hex');
+    console.log('Received postback:', req.body);
 
-    if (generatedHash !== hash) {
-      res.status(400).send("Invalid postback: Signature doesn't match.");
-      return;
-    }
-
-    // Check for duplicate transactions
+    // Checking for duplicate transactions
     const transactionExist = await PostbackModel.findOne({ uid, transaction_id, offer_id: campaign_id });
 
     if (transactionExist) {
-      res.status(200).send("Duplicate transaction detected.");
-      return;
+      return res.status(200).send("Duplicate transaction detected.");
     }
 
-    // Create a new transaction record
+    // Create new transaction record
     const newTransaction = new PostbackModel({
       uid,
       transaction_id,
-      provider_id: 2,
+      provider_id: 3,
       sbx_amount: virtual_currency,
       conversion_ip: ip,
       payout,
@@ -75,6 +75,7 @@ app.post('/postback', async (req, res) => {
       offer_begin_time: begin_time,
       offer_complete_time: complete_time
     });
+
     await newTransaction.save();
 
     // Update user balance
@@ -91,8 +92,10 @@ app.post('/postback', async (req, res) => {
 
     res.status(200).send("Postback received successfully.");
   } catch (error) {
-    console.error('Error processing postback:', error);
-    res.status(500).send("Error processing postback");
+    console.error('Error processing postback:', error.message);
+    console.error('Stack trace:', error.stack);
+
+    res.status(500).send("Error processing postback: " + error.message);
   }
 });
 
